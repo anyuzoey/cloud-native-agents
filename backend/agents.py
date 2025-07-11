@@ -6,6 +6,8 @@ from autogen_agentchat.agents import AssistantAgent, UserProxyAgent
 from autogen_core.tools import FunctionTool
 from tavily import AsyncTavilyClient
 from dotenv import load_dotenv
+from memory import conversation_memory
+
 # Load environment variables from .env file
 load_dotenv()
 
@@ -45,6 +47,9 @@ async def setup_agents_and_tools(user_input_func=None):
         api_key=OPENAI_API_KEY
     )
 
+    # Get ChromaDB memory for agents
+    chroma_memory = await conversation_memory.get_memory_for_agents()
+
     # --- Tool Definitions ---
     async def tavily_search_func(query: str, max_results: int = 5) -> dict:
         client = AsyncTavilyClient(api_key=TAVILY_API_KEY)
@@ -66,30 +71,41 @@ async def setup_agents_and_tools(user_input_func=None):
     tool_adapter_add_issue_comment = await get_tool_adapter("add_issue_comment")
     tool_adapter_get_issue = await get_tool_adapter("get_issue")
 
-    # --- Agent Definitions ---
+    # --- Agent Definitions with ChromaDB Memory ---
     issue_reader = AssistantAgent(
-        name="issue_reader", model_client=model_client, tools=
-        [tool_adapter_get_issue], reflect_on_tool_use=True,
+        name="issue_reader", 
+        model_client=model_client, 
+        tools=[tool_adapter_get_issue], 
+        reflect_on_tool_use=True,
+        memory=[chroma_memory],
         description="Extracts structured information from a GitHub issue.",
         system_message="You are a GitHub Issue Reader. Extract key problem details, error messages, user environment, and summarize the issue using the tool_adapter_get_issue tool. "
     )
 
     researcher = AssistantAgent(
-        name="researcher", model_client=model_client, tools=[tavily_tool], 
+        name="researcher", 
+        model_client=model_client, 
+        tools=[tavily_tool], 
         reflect_on_tool_use=True,
+        memory=[chroma_memory],
         description="Researches related info to assist with resolving the issue.",
         system_message="You are a web researcher. Based on the issue summary, find top 3 related GitHub issues, documentation, and known solutions using the tavily_tool. "
     )
 
     reasoner = AssistantAgent(
-        name="reasoner", model_client=model_client, 
+        name="reasoner", 
+        model_client=model_client,
+        memory=[chroma_memory],
         description="Draft a github comment based on the issue and related research.",
         system_message="You are a technical expert. Given a GitHub issue and related research, suggest potential root causes and actionable next steps and format it as a github comment. "
     )
 
     commenter = AssistantAgent(
-        name="commenter", model_client=model_client, tools=
-        [tool_adapter_add_issue_comment], reflect_on_tool_use=True,
+        name="commenter", 
+        model_client=model_client, 
+        tools=[tool_adapter_add_issue_comment], 
+        reflect_on_tool_use=True,
+        memory=[chroma_memory],
         description="Writes a GitHub comment.",
         system_message="You are a GitHub commenter. If ‘USER EDITED COMMENT:’ is present, post user edited comment as-is. Else, post the reasoner agent’s output as-is. Do not modify or paraphrase either option. After posting the comment, reply with 'TERMINATE'."
     )

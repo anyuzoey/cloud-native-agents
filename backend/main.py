@@ -14,6 +14,7 @@ from autogen_agentchat.base import TaskResult
 
 # Import predefined agents and tools
 from agents import setup_agents_and_tools
+from memory import conversation_memory
 
 # Setup logging
 logger = logging.getLogger(__name__)
@@ -87,24 +88,51 @@ async def analyze_issue_with_comment(request: IssueRequest):
         task = f"Summarize and add next steps for this issue: {request.issue_link}"
         stream = team.run_stream(task=task)
         
-        # Capture the final output from the stream
-        final_output = None
+        # Capture the commenter's actual content (not TERMINATE)
+        commenter_content = None
         async for chunk in stream:
             # Each chunk contains information about the conversation
+            chunk_content = None
             if hasattr(chunk, 'content') and chunk.content:
-                final_output = chunk.content
+                chunk_content = chunk.content
             elif hasattr(chunk, 'message') and chunk.message:
-                final_output = chunk.message.get('content', '')
+                chunk_content = chunk.message.get('content', '')
             elif isinstance(chunk, dict) and 'content' in chunk:
-                final_output = chunk['content']
+                chunk_content = chunk['content']
             elif isinstance(chunk, str):
-                final_output = chunk
+                chunk_content = chunk
+            
+            # Store the last non-TERMINATE content from commenter
+            if chunk_content:
+                # Handle different types of chunk_content
+                if isinstance(chunk_content, str):
+                    if chunk_content.strip() != "TERMINATE":
+                        commenter_content = chunk_content
+                elif isinstance(chunk_content, list):
+                    # If it's a list, join it into a string
+                    chunk_str = " ".join(str(item) for item in chunk_content)
+                    if chunk_str.strip() != "TERMINATE":
+                        commenter_content = chunk_str
+                else:
+                    # Convert to string for other types
+                    chunk_str = str(chunk_content)
+                    if chunk_str.strip() != "TERMINATE":
+                        commenter_content = chunk_str
         
         await agents_and_tools["model_client"].close()
         
-        # Return the actual final output if captured, otherwise a success message
-        if final_output:
-            return {"response": final_output}
+        # Store conversation in ChromaDB memory (commenter's response, not TERMINATE)
+        session_id = f"session_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+        await conversation_memory.store_conversation(
+            user_query=request.issue_link,
+            agent_response=commenter_content or "Comment generated and posted successfully",
+            session_id=session_id,
+            metadata={"endpoint": "issue_next_steps_with_comment", "agent": "commenter"}
+        )
+        
+        # Return the actual commenter content if captured, otherwise a success message
+        if commenter_content:
+            return {"response": commenter_content}
         else:
             return {"response": "Comment generated and posted successfully. Check the issue for details."}
 
@@ -148,6 +176,15 @@ async def analyze_issue_without_comment(request: IssueRequest):
                 final_output = chunk
         
         await agents_and_tools["model_client"].close()
+        
+        # Store conversation in ChromaDB memory (reasoner's response)
+        session_id = f"session_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+        await conversation_memory.store_conversation(
+            user_query=request.issue_link,
+            agent_response=final_output or "Analysis completed successfully",
+            session_id=session_id,
+            metadata={"endpoint": "issue_next_steps_analysis", "agent": "reasoner"}
+        )
         
         # Return the actual final output if captured, otherwise a success message
         if final_output:
@@ -245,6 +282,7 @@ async def analyze_issue_with_hitl_comment(websocket: WebSocket):
         
         # Stream the conversation
         stream = team.run_stream(task=task)
+        
         try:
             async for message in stream:
                 if isinstance(message, TaskResult):
@@ -254,6 +292,32 @@ async def analyze_issue_with_hitl_comment(websocket: WebSocket):
                 if websocket_closed:
                     logger.warning("WebSocket closed, stopping message stream")
                     break
+                
+                # If this message is from commenter, store it in memory immediately (but not TERMINATE)
+                if hasattr(message, 'sender') and message.sender == 'commenter':
+                    commenter_content = None
+                    if hasattr(message, 'content') and message.content:
+                        commenter_content = message.content
+                    elif hasattr(message, 'message') and message.message:
+                        commenter_content = message.message.get('content', '')
+                    elif isinstance(message, dict) and 'content' in message:
+                        commenter_content = message['content']
+                    elif isinstance(message, str):
+                        commenter_content = message
+                    
+                    # Only store if it's not the TERMINATE message
+                    if commenter_content and commenter_content.strip() != "TERMINATE":
+                        # Store commenter response in ChromaDB memory immediately
+                        session_id = f"hitl_session_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+                        await conversation_memory.store_conversation(
+                            user_query=request.content,
+                            agent_response=commenter_content,
+                            session_id=session_id,
+                            metadata={"endpoint": "ws_issue_next_steps_with_hitl_comment", "agent": "commenter"}
+                        )
+                        logger.info(f"💾 Stored commenter response in memory: {commenter_content[:100]}...")
+                    elif commenter_content and commenter_content.strip() == "TERMINATE":
+                        logger.info("⏭️ Skipping TERMINATE message from commenter")
                     
                 try:
                     # Convert datetime objects to strings before sending
